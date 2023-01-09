@@ -65,7 +65,8 @@ func (mq *RabbitMq) Publish(queue string, msg string) error {
 
 }
 
-func (mq *RabbitMq) Consumer(queue string, body *chan string) error {
+func (mq *RabbitMq) Consumer(queue string, body *chan string, exit chan struct{}) {
+	defer fmt.Println("kire khar consume rabbit")
 	messages, err := mq.Channel.Consume(
 		queue, // queue name
 		"",    // consumer
@@ -76,17 +77,22 @@ func (mq *RabbitMq) Consumer(queue string, body *chan string) error {
 		nil,   // arguments
 	)
 	if err != nil {
-		return err
+		return
 	}
-
 	for {
 		select {
-		case t := <-messages:
-			*body <- string(t.Body)
+		case msg, ok := <-messages:
+			if !ok {
+				fmt.Println(err)
+				continue
+			}
+			*body <- string(msg.Body)
+			fmt.Println(queue, "")
+		case <-exit:
+			return
 		}
 	}
 
-	return nil
 }
 
 func (mq *RabbitMq) Queues(queues *chan []string) error {
@@ -126,7 +132,7 @@ func queueList(url, user, pass string) ([]string, error) {
 	value := make([]Queue, 0)
 	json.NewDecoder(resp.Body).Decode(&value)
 	for _, queue := range value {
-		if !strings.HasPrefix(queue.Name, "Output") {
+		if !strings.HasPrefix(queue.Name, "output") {
 			if !strings.HasPrefix(queue.Name, "amq.gen") {
 				result = append(result, queue.Name)
 			}

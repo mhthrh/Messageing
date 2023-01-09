@@ -36,6 +36,7 @@ type Dispatcher struct {
 	Channel       any
 }
 type Server struct {
+	Typ  string
 	Name string
 	Ip   string
 	Port int
@@ -91,29 +92,58 @@ func WriteConfig() string {
 		},
 		Listeners: []Server{
 			{
+				Typ:  "Sync",
 				Name: "Server1",
 				Ip:   "127.0.0.1",
 				Port: 8585,
 			},
 			{
+				Typ:  "Sync",
 				Name: "Server2",
 				Ip:   "127.0.0.1",
 				Port: 8586,
 			},
 			{
+				Typ:  "Sync",
 				Name: "Server3",
 				Ip:   "127.0.0.1",
 				Port: 8587,
 			},
 			{
+				Typ:  "Async",
 				Name: "Server4",
 				Ip:   "127.0.0.1",
 				Port: 8588,
 			},
 			{
+				Typ:  "Async",
 				Name: "Server5",
 				Ip:   "127.0.0.1",
 				Port: 8589,
+			},
+			{
+				Typ:  "Async",
+				Name: "Server5",
+				Ip:   "127.0.0.1",
+				Port: 8590,
+			},
+			{
+				Typ:  "Async",
+				Name: "Server5",
+				Ip:   "127.0.0.1",
+				Port: 8591,
+			},
+			{
+				Typ:  "Async",
+				Name: "Server5",
+				Ip:   "127.0.0.1",
+				Port: 8592,
+			},
+			{
+				Typ:  "Async",
+				Name: "Server5",
+				Ip:   "127.0.0.1",
+				Port: 8593,
 			},
 		},
 		Rabbit: RabbitMQ{

@@ -3,6 +3,7 @@ package main
 import (
 	"Github.com/mhthrh/EventDriven/Gateway/View"
 	"Github.com/mhthrh/EventDriven/Model/Tool"
+	"Github.com/mhthrh/EventDriven/Utilitys/Config"
 	"context"
 	"fmt"
 	"github.com/gorilla/mux"
@@ -27,6 +28,8 @@ func init() {
 }
 
 func main() {
+	ddd := Config.WriteConfig()
+	fmt.Println(ddd)
 	toolAsync, err := Tool.New(1)
 	if err != nil {
 		log.Fatalln(err)
@@ -42,9 +45,12 @@ func main() {
 		if err != nil {
 			log.Fatalln(err)
 		}
-
 		smAsync := mux.NewRouter()
-		View.RunApiOnRouter(smAsync, *tool)
+		if value.Typ == "Sync" {
+			View.RunApiOnRouterSync(smAsync, *tool)
+		} else {
+			View.RunApiOnRouterAsync(smAsync, *tool)
+		}
 		serverAsync := http.Server{
 			Addr:         fmt.Sprintf("%s:%d", ip, port),
 			Handler:      smAsync,

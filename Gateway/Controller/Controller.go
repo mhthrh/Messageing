@@ -14,9 +14,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/gorilla/websocket"
 	"github.com/pborman/uuid"
+	"github.com/streadway/amqp"
 	"log"
 	"net/http"
 	"strings"
@@ -46,14 +48,17 @@ type (
 	Key struct {
 	}
 	GatewayDispatcher struct {
-		ID          uuid.UUID
-		UserName    string
-		Token       string
-		ReadWs      chan string
-		WriteWs     chan string
-		ReadRabbit  chan string
-		WriteRabbit chan string
-		Connection  *websocket.Conn
+		ID            uuid.UUID
+		UserName      string
+		Token         string
+		SenderQueue   string
+		MainQueueNAme string
+		ReadWs        chan string
+		WriteWs       chan string
+		ReadRabbit    chan string
+		WriteRabbit   chan struct{ queue, message string }
+		Connection    *websocket.Conn
+		Control       *Controller
 	}
 
 	Controller struct {
@@ -62,11 +67,6 @@ type (
 		Redis      *Redis.Client
 		Validation *Validation.Validation
 		Cnfg       *Config.Config
-	}
-
-	Agent struct {
-		cont *Controller
-		conn *websocket.Conn
 	}
 )
 
@@ -129,13 +129,17 @@ func (c *Controller) MiddleWare(next http.Handler) http.Handler {
 func (c Controller) Message(w http.ResponseWriter, r *http.Request) {
 
 	handler := GatewayDispatcher{
-		ID:          uuid.NewUUID(),
-		UserName:    r.Header.Get("X-Websocket-user"),
-		Token:       r.Header.Get("X-Websocket-token"),
-		ReadWs:      make(chan string),
-		WriteWs:     make(chan string),
-		ReadRabbit:  make(chan string),
-		WriteRabbit: make(chan string),
+		ID:            uuid.NewUUID(),
+		MainQueueNAme: r.Host,
+		UserName:      r.Header.Get("X-Websocket-user"),
+		Token:         r.Header.Get("X-Websocket-token"),
+		SenderQueue:   fmt.Sprintf("output-%s", r.Header.Get("X-Websocket-user")),
+		ReadWs:        make(chan string),
+		WriteWs:       make(chan string),
+		ReadRabbit:    make(chan string),
+		WriteRabbit:   make(chan struct{ queue, message string }),
+		Connection:    nil,
+		Control:       &c,
 	}
 	Ctx1, cancel := context.WithTimeout(context.Background(), time.Second*10)
 	defer cancel()
@@ -175,172 +179,24 @@ func (c Controller) Message(w http.ResponseWriter, r *http.Request) {
 
 	if err != nil {
 		conn.WriteMessage(websocket.CloseMessage, []byte("bad request"))
+		conn.Close()
 		return
 	}
 
 	handler.Connection = conn
 
-	go readWs(conn, &handler.ReadWs)
-	go writeWs(conn, &handler.WriteWs)
-
-	if err = c.Rabbit.DeclareQueue(r.Host); err != nil {
+	if err = c.Rabbit.DeclareQueue(handler.MainQueueNAme); err != nil {
 		conn.WriteMessage(websocket.CloseMessage, []byte("server error"))
-		return
-	}
-	senderQueue := fmt.Sprintf("Output-%s", handler.UserName)
-
-	if err = c.Rabbit.DeclareQueue(senderQueue); err != nil {
-		conn.WriteMessage(websocket.CloseMessage, []byte("server error"))
+		conn.Close()
 		return
 	}
 
-	go c.Rabbit.Consumer(senderQueue, &handler.ReadRabbit)
-
-	go func(agent *Agent) {
-		go func(rr *websocket.Conn) {
-			c := time.Tick(time.Millisecond * 100)
-			for range c {
-				err := rr.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(writeWait))
-				if err != nil {
-					fmt.Println("be gaaaaa")
-				}
-				_, byt, err := rr.ReadMessage()
-				if err != nil {
-					fmt.Println("be gaaaa raftim")
-				}
-				fmt.Println(string(byt))
-			}
-		}(conn)
-
-		for {
-			select {
-			case message, ok := <-handler.ReadWs:
-				if !ok {
-					agent.conn.WriteMessage(websocket.CloseMessage, []byte{})
-					return
-				}
-				m, err := Message.CreateStruct(message)
-				if err != nil {
-					handler.WriteWs <- err.Error()
-					fmt.Println(err)
-					continue
-				}
-				Ctx, _ := context.WithTimeout(context.Background(), time.Second*10)
-				db := c.Database.Pull()
-				User.New(db, c.Redis, &Ctx)
-				sender := User.User{
-					Header:   Request.Request{},
-					Name:     "",
-					LastName: "",
-					UserName: m.Sender.UserName,
-					PassWord: "",
-					Email:    "",
-					Avatar:   "",
-					Token:    m.Sender.Token,
-				}
-				receiver := User.User{
-					Header:   Request.Request{},
-					Name:     "",
-					LastName: "",
-					UserName: m.Receiver.UserName,
-					PassWord: "",
-					Email:    "",
-					Avatar:   "",
-					Token:    "",
-				}
-
-				if exist := receiver.ExistUser(); exist == false {
-					c.Database.Push(db)
-					handler.WriteWs <- Json.New(nil, nil).Struct2Json(&Message.Acknowledge{
-						ClientId:      m.ClientId,
-						ServerId:      m.ServerId,
-						ReceiveTime:   m.DateTime,
-						Type:          "ack",
-						StatusCode:    -1,
-						StatusMessage: "receiver not valid",
-					})
-					continue
-				}
-				valid, err := sender.TokenIsValid()
-				c.Database.Push(db)
-				if err != nil {
-					handler.WriteWs <- Json.New(nil, nil).Struct2Json(&Message.Acknowledge{
-						ClientId:      m.ClientId,
-						ServerId:      m.ServerId,
-						ReceiveTime:   m.DateTime,
-						Type:          "ack",
-						StatusCode:    -1,
-						StatusMessage: err.Error(),
-					})
-					fmt.Println(err)
-					continue
-				}
-				if !valid {
-					handler.WriteWs <- "Token is not valid"
-					conn.WriteMessage(websocket.CloseMessage, []byte("Token is not valid"))
-					return
-				}
-
-				message = Json.New(nil, nil).Struct2Json(&m)
-				fmt.Println(r.Host, "==>", message)
-				err = agent.cont.Rabbit.Publish(r.Host, message)
-				if err != nil {
-					handler.WriteWs <- Json.New(nil, nil).Struct2Json(&Message.Acknowledge{
-						ClientId:      m.ClientId,
-						ServerId:      m.ServerId,
-						ReceiveTime:   m.DateTime,
-						Type:          "ack",
-						StatusCode:    -1,
-						StatusMessage: err.Error(),
-					})
-					fmt.Println(err)
-					continue
-				}
-
-				handler.WriteWs <- Json.New(nil, nil).Struct2Json(&Message.Acknowledge{
-					ClientId:      m.ClientId,
-					ServerId:      m.ServerId,
-					ReceiveTime:   m.DateTime,
-					Type:          "Received By System",
-					StatusCode:    0,
-					StatusMessage: "Success",
-				})
-
-			case message, ok := <-handler.ReadRabbit:
-				if !ok {
-					agent.conn.WriteMessage(websocket.CloseMessage, []byte{})
-					return
-				}
-
-				if !strings.HasPrefix(message, "102030") {
-					handler.WriteWs <- message
-					continue
-				}
-				var res Message.Response
-
-				dddd := strings.Replace(message, "102030", "", 1)
-				if err := Json.New(nil, nil).Json2Struct([]byte(dddd), &res); err != nil {
-
-				}
-				_ = agent.cont.Rabbit.Publish(fmt.Sprintf("Output-%s", res.Sender), Json.New(nil, nil).Struct2Json(&res.Ack))
-				res.Ack = Message.Acknowledge{
-					ClientId:      nil,
-					ServerId:      nil,
-					ReceiveTime:   "",
-					Type:          "",
-					StatusCode:    0,
-					StatusMessage: "",
-				}
-				handler.WriteWs <- Json.New(nil, nil).Struct2Json(&res)
-
-			}
-		}
-
-	}(&Agent{
-		cont: &c,
-		conn: conn,
-	})
-
+	if err = c.Rabbit.DeclareQueue(handler.SenderQueue); err != nil {
+		conn.WriteMessage(websocket.CloseMessage, []byte("server error"))
+		conn.Close()
+		return
+	}
+	go serveNewSocket(&handler)
 }
 
 func (c *Controller) SignUp(writer http.ResponseWriter, request *http.Request) {
@@ -434,73 +290,290 @@ func (c *Controller) Search(writer http.ResponseWriter, request *http.Request) {
 	Result.New(1, http.StatusOK, "username is available").SendResponse(writer)
 }
 
-func readWs(conn *websocket.Conn, data *chan string) {
+func serveNewSocket(agent *GatewayDispatcher) {
+	ch1 := make(chan error)
+
+	ch2, ch4, ch5, ch6, ch7 := make(chan struct{}), make(chan struct{}), make(chan struct{}), make(chan struct{}), make(chan struct{})
 	defer func() {
-		conn.Close()
+		close(ch1)
+		close(ch2)
+		//close(ch3)
+		close(ch4)
+		close(ch5)
+		close(ch6)
+		close(ch7)
+		agent = nil
 	}()
-	conn.SetReadLimit(maxMessageSize)
-	conn.SetReadDeadline(time.Now().Add(pongWait))
-	conn.SetPongHandler(func(string) error {
-		conn.SetReadDeadline(time.Now().Add(pongWait))
-		return nil
-	})
-	for {
-		_, message, err := conn.ReadMessage()
+	//Ping Websocket
+	go func(cnn *websocket.Conn, msg *chan error, exit chan struct{}) {
+		defer cnn.Close()
+		for {
+			select {
+			case <-exit:
+				fmt.Println("exit connection ping")
+				return
+			case <-time.Tick(time.Millisecond * 100):
+				if err := cnn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(time.Millisecond*200)); err != nil {
+					*msg <- fmt.Errorf("canot access to webSoket")
+				}
+			}
+		}
+
+	}(agent.Connection, &ch1, ch2)
+	//Read WebSocket
+	go func(cnn *websocket.Conn, msg chan string, exit chan struct{}) {
+		defer func() {
+			_ = cnn.Close()
+			fmt.Println("close Read WebSocket")
+		}()
+		cnn.SetReadLimit(maxMessageSize)
+
+		for {
+			select {
+			case <-exit:
+				fmt.Println("exit websocket reader")
+				return
+			default:
+				_, message, err := cnn.ReadMessage()
+				if err != nil {
+					if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+						log.Printf("error: %v", err)
+					}
+					continue
+				}
+				message = bytes.TrimSpace(bytes.Replace(message, newline, space, -1))
+				msg <- string(message)
+			}
+		}
+
+	}(agent.Connection, agent.ReadWs, ch4)
+	//Write Websocket
+	go func(conn *websocket.Conn, data *chan string, exit chan struct{}) {
+		ticker := time.NewTicker(pingPeriod)
+		defer func() {
+			ticker.Stop()
+			conn.Close()
+			fmt.Println("close Write Websocket")
+		}()
+		for {
+			select {
+			case <-exit:
+				return
+			case message, ok := <-*data:
+				conn.SetWriteDeadline(time.Now().Add(writeWait))
+				if !ok {
+					conn.WriteMessage(websocket.CloseMessage, []byte{})
+					return
+				}
+
+				w, err := conn.NextWriter(websocket.TextMessage)
+				if err != nil {
+					return
+				}
+				w.Write([]byte(message))
+
+				if err := w.Close(); err != nil {
+					return
+				}
+			case <-ticker.C:
+				conn.SetWriteDeadline(time.Now().Add(writeWait))
+				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+					return
+				}
+			}
+		}
+	}(agent.Connection, &agent.WriteWs, ch6)
+	//Write Queue
+	go func(tt chan struct{ queue, message string }, exit chan struct{}) {
+		defer fmt.Println("close Write Queue")
+		for {
+			select {
+			case t, ok := <-tt:
+				if !ok {
+
+				}
+				//err := agent.Control.Rabbit.Publish(fmt.Sprintf("output-%s", strings.Split(message, "#")[0]), Json.New(nil, nil).Struct2Json(strings.Split(message, "#")[1:]))
+				//	ffff := Json.New(nil, nil).Struct2Json(t.message)
+				err := agent.Control.Rabbit.Publish(t.queue, t.message)
+				fmt.Println(t.queue, "  ", t.message)
+				if err != nil {
+
+				}
+
+			case <-exit:
+				return
+			}
+		}
+
+	}(agent.WriteRabbit, ch7)
+	//Read Queue
+	go func(queue string, body *chan string, exit chan struct{}) {
+		defer func() {
+		}()
+		connectRabbitMQ, err := amqp.Dial(fmt.Sprintf("amqp://%s:%s@%s:%d/", agent.Control.Cnfg.Rabbit.UserName, agent.Control.Cnfg.Rabbit.Password, agent.Control.Cnfg.Rabbit.Host, agent.Control.Cnfg.Rabbit.Port))
+		defer connectRabbitMQ.Close()
 		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("error: %v", err)
-			}
-			break
+
 		}
-		message = bytes.TrimSpace(bytes.Replace(message, newline, space, -1))
-		*data <- string(message)
-	}
-}
+		channelRabbitMQ, err := connectRabbitMQ.Channel()
+		defer channelRabbitMQ.Close()
+		if err != nil {
 
-func writeWs(conn *websocket.Conn, data *chan string) {
-	ticker := time.NewTicker(pingPeriod)
-	defer func() {
-		ticker.Stop()
-		conn.Close()
-	}()
-	for {
-		select {
-		case message, ok := <-*data:
-			conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if !ok {
-				conn.WriteMessage(websocket.CloseMessage, []byte{})
-				return
-			}
-
-			w, err := conn.NextWriter(websocket.TextMessage)
-			if err != nil {
-				return
-			}
-			w.Write([]byte(message))
-
-			if err := w.Close(); err != nil {
-				return
-			}
-		case <-ticker.C:
-			conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-				return
-			}
 		}
-	}
-}
 
-func ping(ws *websocket.Conn, done chan struct{}) {
-	ticker := time.NewTicker(pingPeriod)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			if err := ws.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(writeWait)); err != nil {
-				log.Println("ping:", err)
-			}
-		case <-done:
+		messages, err := channelRabbitMQ.Consume(
+			queue, // queue name
+			"",    // consumer
+			true,  // auto-ack
+			false, // exclusive
+			false, // no local
+			false, // no wait
+			nil,   // arguments
+		)
+		if err != nil {
 			return
 		}
+		for {
+			select {
+			case msg, ok := <-messages:
+				if !ok {
+					fmt.Println(err)
+					continue
+				}
+				*body <- string(msg.Body)
+				fmt.Println(queue, "")
+			case <-exit:
+				return
+			}
+		}
+
+	}(agent.SenderQueue, &agent.ReadRabbit, ch5)
+
+	for {
+		select {
+		//listener for receive exit signal
+		case message, ok := <-ch1:
+			if message != nil || !ok {
+				ch2 <- struct{}{}
+				ch4 <- struct{}{}
+				ch5 <- struct{}{}
+				ch6 <- struct{}{}
+				ch7 <- struct{}{}
+				fmt.Println(message)
+				return
+			}
+		case message, ok := <-agent.ReadWs:
+			if !ok {
+
+			}
+			m, err := Message.CreateStruct(message)
+			if err != nil {
+				agent.WriteWs <- err.Error()
+				fmt.Println(err)
+				continue
+			}
+			Ctx, _ := context.WithTimeout(context.Background(), time.Second*10)
+			db := agent.Control.Database.Pull()
+			User.New(db, agent.Control.Redis, &Ctx)
+			sender := User.User{
+				Header:   Request.Request{},
+				Name:     "",
+				LastName: "",
+				UserName: m.Sender.UserName,
+				PassWord: "",
+				Email:    "",
+				Avatar:   "",
+				Token:    m.Sender.Token,
+			}
+			receiver := User.User{
+				Header:   Request.Request{},
+				Name:     "",
+				LastName: "",
+				UserName: m.Receiver.UserName,
+				PassWord: "",
+				Email:    "",
+				Avatar:   "",
+				Token:    "",
+			}
+
+			if exist := receiver.ExistUser(); exist == false {
+				agent.Control.Database.Push(db)
+				agent.WriteWs <- Json.New(nil, nil).Struct2Json(&Message.Acknowledge{
+					ClientId:      m.ClientId,
+					ServerId:      m.ServerId,
+					ReceiveTime:   m.DateTime,
+					Type:          "ack",
+					StatusCode:    -1,
+					StatusMessage: "receiver not valid",
+				})
+				continue
+			}
+			valid, err := sender.TokenIsValid()
+			agent.Control.Database.Push(db)
+			if !valid {
+				agent.WriteWs <- "Token is not valid"
+				ch1 <- errors.New("token is not valid")
+				continue
+			}
+			if err != nil {
+				agent.WriteWs <- Json.New(nil, nil).Struct2Json(&Message.Acknowledge{
+					ClientId:      m.ClientId,
+					ServerId:      m.ServerId,
+					ReceiveTime:   m.DateTime,
+					Type:          "ack",
+					StatusCode:    -1,
+					StatusMessage: err.Error(),
+				})
+				fmt.Println(err)
+				continue
+			}
+			agent.WriteRabbit <- struct{ queue, message string }{queue: agent.MainQueueNAme, message: Json.New(nil, nil).Struct2Json(&m)}
+
+			if err != nil {
+				agent.WriteWs <- Json.New(nil, nil).Struct2Json(&Message.Acknowledge{
+					ClientId:      m.ClientId,
+					ServerId:      m.ServerId,
+					ReceiveTime:   m.DateTime,
+					Type:          "ack",
+					StatusCode:    -1,
+					StatusMessage: err.Error(),
+				})
+				fmt.Println(err)
+				continue
+			}
+			agent.WriteWs <- Json.New(nil, nil).Struct2Json(&Message.Acknowledge{
+				ClientId:      m.ClientId,
+				ServerId:      m.ServerId,
+				ReceiveTime:   m.DateTime,
+				Type:          "Received By System",
+				StatusCode:    0,
+				StatusMessage: "Success",
+			})
+		case message, ok := <-agent.ReadRabbit:
+			if !ok {
+
+			}
+			if !strings.HasPrefix(message, "102030") {
+				agent.WriteWs <- message
+				continue
+			}
+			var res Message.Response
+
+			if err := Json.New(nil, nil).Json2Struct([]byte(strings.Replace(message, "102030", "", 1)), &res); err != nil {
+
+			}
+			agent.WriteRabbit <- struct{ queue, message string }{queue: fmt.Sprintf("output-%s", res.Sender), message: Json.New(nil, nil).Struct2Json(&res.Ack)}
+			res.Ack = Message.Acknowledge{
+				ClientId:      nil,
+				ServerId:      nil,
+				ReceiveTime:   "",
+				Type:          "",
+				StatusCode:    0,
+				StatusMessage: "",
+			}
+			agent.WriteWs <- Json.New(nil, nil).Struct2Json(&res)
+
+		}
 	}
+
 }

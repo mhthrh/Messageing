@@ -13,17 +13,26 @@ var (
 	controller                *Controller.Controller
 )
 
-func RunApiOnRouter(sm *mux.Router, tool Tool.Tool) {
+func RunApiOnRouterSync(sm *mux.Router, tool Tool.Tool) {
 	controller = Controller.New(tool.Rabbit, tool.DB, tool.Redis, tool.Validation, tool.Config)
-	getServices = sm.Methods(http.MethodGet).Subrouter()
 	postServices = sm.Methods(http.MethodPost).Subrouter()
-	//sm.Use(controller.MiddleWare)
-
-	getServices.HandleFunc("/message", controller.Message)
+	sm.Use(controller.MiddleWare)
 
 	postServices.HandleFunc("/signup", controller.SignUp)
 	postServices.HandleFunc("/signin", controller.SignIn)
 	postServices.HandleFunc("/usersearch", controller.Search)
+
+	sm.NotFoundHandler = http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		Result.New(1003, http.StatusBadRequest, "bia boro to konam, kir shodi :)").SendResponse(writer)
+		return
+	})
+}
+
+func RunApiOnRouterAsync(sm *mux.Router, tool Tool.Tool) {
+	controller = Controller.New(tool.Rabbit, tool.DB, tool.Redis, tool.Validation, tool.Config)
+	getServices = sm.Methods(http.MethodGet).Subrouter()
+
+	getServices.HandleFunc("/message", controller.Message)
 
 	sm.NotFoundHandler = http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		Result.New(1003, http.StatusBadRequest, "bia boro to konam, kir shodi :)").SendResponse(writer)

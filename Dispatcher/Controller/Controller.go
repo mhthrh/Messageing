@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/pborman/uuid"
+	"strings"
 	"sync"
 	"time"
 )
@@ -62,7 +63,7 @@ func (c Controller) Run(msg, wait *chan struct{}) {
 					if !ok {
 						body := make(chan string)
 						dic[queue] = body
-						go c.Rabbit.Consumer(queue, &body)
+						go c.Rabbit.Consumer(queue, &body, nil)
 					}
 				}
 			case <-e:
@@ -86,6 +87,9 @@ func (c Controller) Run(msg, wait *chan struct{}) {
 					select {
 					case msg := <-value:
 						fmt.Println(msg)
+						if len(strings.Trim(msg, " ")) < 5 {
+							continue
+						}
 						i++
 						wait.Add(i)
 						go c.runMethod(msg, wait)
@@ -112,12 +116,15 @@ func (c Controller) runMethod(message string, wait sync.WaitGroup) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 	defer cancel()
 	defer wait.Done()
-	var m Message.Request
+	m := Message.Request{}
 	if err := Json.New(nil, nil).Json2Struct([]byte(message), &m); err != nil {
 	}
-
-	outReceiver := fmt.Sprintf("Output-%s", m.Receiver.UserName)
-	outSender := fmt.Sprintf("Output-%s", m.Sender.UserName)
+	if m.Receiver.UserName == "" || m.Sender.UserName == "" {
+		fmt.Println("Empty Struct")
+		return
+	}
+	outReceiver := fmt.Sprintf("output-%s", m.Receiver.UserName)
+	outSender := fmt.Sprintf("output-%s", m.Sender.UserName)
 
 	err := c.Rabbit.DeclareQueue(outReceiver)
 	if err != nil {
